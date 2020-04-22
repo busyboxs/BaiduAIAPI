@@ -4,6 +4,8 @@ import math
 import numpy as np
 import cv2
 
+hub.logger.setLevel('ERROR')
+
 
 def rotate_bound(image, angle):
     (h, w) = image.shape[:2]
@@ -34,6 +36,8 @@ COLORS = [get_random_color() for _ in LABELS]
 def get_landmarks(img):
     module = hub.Module(name="face_landmark_localization")
     result = module.keypoint_detection(images=[img])
+    if len(result) == 0:
+        return None
     landmarks = result[0]['data'][0]
     return landmarks
 
@@ -41,6 +45,8 @@ def get_landmarks(img):
 def get_face_rectangle(img):
     face_detector = hub.Module(name="ultra_light_fast_generic_face_detector_1mb_320")
     result = face_detector.face_detection(images=[img])
+    if len(result) == 0:
+        return None, None, None, None
     x1 = int(result[0]['data'][0]['left'])
     y1 = int(result[0]['data'][0]['top'])
     x2 = int(result[0]['data'][0]['right'])
@@ -50,6 +56,8 @@ def get_face_rectangle(img):
 
 def face_landmarks(face_image, location_of_face=None):
     landmarks = get_landmarks(face_image)
+    if landmarks is None:
+        return None
     landmarks_as_tuples = [[(int(p[0]), int(p[1])) for p in landmarks]]
     return [{
         "chin": points[0:17],
@@ -74,6 +82,27 @@ def get_bound_box(points):
     return min_x, min_y, width, height
 
 
+def check_if_mouth_open(img, points):
+    middle_points = []
+    middle_points.append(points["top_lip"][6])
+    middle_points.append(points["top_lip"][7])
+    middle_points.append(points["top_lip"][8])
+
+    middle_points.append(points["bottom_lip"][len(points["bottom_lip"]) - 2])
+    middle_points.append(points["bottom_lip"][len(points["bottom_lip"]) - 3])
+    middle_points.append(points["bottom_lip"][len(points["bottom_lip"]) - 4])
+
+    min_x, min_y, w, h = get_bound_box(middle_points)
+    # cv2.rectangle(img, (min_x, min_y), (min_x + w, min_y + h), (255, 0, 0), 2)
+    x, y, w_bottom_lip, h_bottom_lip = face_part(points, "bottom_lip")
+
+    # cv2.rectangle(img, (x, y), (x + w_bottom_lip, y + h_bottom_lip), (255, 255, 0), 2)
+
+    if h > h_bottom_lip / 2:
+        return True
+    return False
+
+
 def face_part(points, part):
     assert part in LABELS, "face_part should be in [" + ','.join(LABELS) + ']'
     x, y, w, h = get_bound_box(points[part])
@@ -85,26 +114,106 @@ def calculate_angle(point1, point2):
     return 180 / math.pi * math.atan((float(y2 - y1)) / (x2 - x1))
 
 
-def add_sticker_cat(img):
-    sticker_img = 'stickers/cat.png'
-    sticker = cv2.imread(sticker_img, -1)
-    landmarks = face_landmarks(img)
+def get_top_left(img, sticker, landmarks, base_center, ratio, face_part, point_order, extra=[0, 0]):
+    # check_if_mouth_open(img, landmarks[0])
     angle = calculate_angle(landmarks[0]['left_eyebrow'][0], landmarks[0]['right_eyebrow'][-1])
-    nose_tip_center = [180, 400]  # nose center of sticker
+    nose_tip_center = base_center
     rotated, M = rotate_bound(sticker, angle)
     tip_center_rotate = np.dot(M, np.array([[nose_tip_center[0]], [nose_tip_center[1]], [1]]))
-    sticker_h, sticker_w,  _ = rotated.shape
+    sticker_h, sticker_w, _ = rotated.shape
     x, y, w, h = get_face_rectangle(img)
-    dv = w / sticker_w
+    if x is None:
+        return None, None, None
+    dv = w / sticker_w * ratio
     distance_x, distance_y = int(tip_center_rotate[0] * dv), int(tip_center_rotate[1] * dv)
     rotated = cv2.resize(rotated, (0, 0), fx=dv, fy=dv)
+    if len(point_order) == 2:
+        y_top_left = (landmarks[0][face_part[0]][point_order[0]][1] + landmarks[0][face_part[1]][point_order[1]][1]) // 2 - distance_y - extra[1]
+        x_top_left = (landmarks[0][face_part[0]][point_order[0]][0] + landmarks[0][face_part[1]][point_order[1]][0]) // 2 - distance_x - extra[0]
+    else:
+        y_top_left = landmarks[0][face_part[0]][point_order[0]][1] - distance_y
+        x_top_left = landmarks[0][face_part[0]][point_order[0]][0] - distance_x
+    return y_top_left, x_top_left, rotated
+
+
+def add_sticker(img, sticker_name, base_center, ratio, face_part, point_order, extra=[0, 0]):
+    sticker = cv2.imread(sticker_name, -1)
+    landmarks = face_landmarks(img)
+    if landmarks is None:
+        return img
+    y_top_left, x_top_left, rotated = get_top_left(img, sticker, landmarks, base_center, ratio, face_part, point_order, extra)
+    if y_top_left is None:
+        return img
     sticker_h, sticker_w, _ = rotated.shape
-    y_top_left = landmarks[0]['nose_tip'][2][1] - distance_y
-    x_top_left = landmarks[0]['nose_tip'][2][0] - distance_x
+    start = 0
+    if y_top_left < 0:
+        sticker_h = sticker_h + y_top_left
+        start = -y_top_left
+        y_top_left = 0
+
     for chanel in range(3):
         img[y_top_left:y_top_left + sticker_h, x_top_left:x_top_left + sticker_w, chanel] = \
-            rotated[:, :, chanel] * (rotated[:, :, 3] / 255.0) + \
+            rotated[start:, :, chanel] * (rotated[start:, :, 3] / 255.0) + \
             img[y_top_left:y_top_left + sticker_h, x_top_left:x_top_left + sticker_w, chanel] \
-            * (1.0 - rotated[:, :, 3] / 255.0)
+            * (1.0 - rotated[start:, :, 3] / 255.0)
 
     return img
+
+
+def add_sticker_ears(img):
+    sticker_img = f'stickers/ears.png'
+    center = [133, 150]
+    face_part = ['left_eyebrow', 'right_eyebrow']
+    point_order = [2, 2]
+    img = add_sticker(img, sticker_img, center, 1.5, face_part, point_order)
+    return img
+
+
+def add_sticker_flowers(img):
+    sticker_img = f'stickers/flowers.png'
+    center = [251, 252]
+    face_part = ['left_eyebrow', 'right_eyebrow']
+    point_order = [2, 2]
+    img = add_sticker(img, sticker_img, center, 1.5, face_part, point_order)
+    return img
+
+
+def add_sticker_hat(img):
+    sticker_img = f'stickers/pirate.png'
+    center = [300, 300]
+    face_part = ['left_eyebrow', 'right_eyebrow']
+    point_order = [2, 2]
+    extra = [0, 25]
+    img = add_sticker(img, sticker_img, center, 1.3, face_part, point_order, extra)
+    return img
+
+
+def add_sticker_mask(img):
+    sticker_img = f'stickers/smallmask.png'
+    center = [150, 80]
+    face_part = ['left_eye', 'right_eye']
+    point_order = [0, 3]
+    img = add_sticker(img, sticker_img, center, 1.0, face_part, point_order)
+    return img
+
+
+def add_sticker_glasses(img):
+    sticker_img = f'stickers/glasses.png'
+    center = [360, 270]
+    face_part = ['left_eye', 'right_eye']
+    point_order = [0, 3]
+    img = add_sticker(img, sticker_img, center, 1.0, face_part, point_order)
+    return img
+
+
+def add_sticker_ear_and_nose(img, sticker_name):
+    stickers = {'cat': 'cat', 'mouse': 'mouse'}
+    nose_center = {'cat': [180, 400], 'mouse': [208, 313]}
+    sticker_img = f'stickers/{stickers[sticker_name]}.png'
+    face_part = ['nose_tip']
+    point_order = [2]
+    img = add_sticker(img, sticker_img, nose_center[sticker_name], 1.0, face_part, point_order)
+    return img
+
+
+
